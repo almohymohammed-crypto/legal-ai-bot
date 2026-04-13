@@ -134,13 +134,24 @@ ${text}
   );
 
   return ai.data.output[0].content[0].text;
-}
+  
+async function sendUpgradeMessage(chatId) {
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    chat_id: chatId,
+    text: `🚫 انتهى الحد المجاني لديك
 
-function getLimitReachedMessage() {
-  return `🚫 انتهى الحد المجاني لديك (10 رسائل).
-
-للاستمرار، اشترك في الباقة المدفوعة.
-سيتم قريبًا توفير رابط الاشتراك داخل البوت.`;
+اشترك الآن للحصول على استخدام غير محدود 🚀`,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "اشترك الآن 💳",
+            url: "https://your-payment-link.com"
+          }
+        ]
+      ]
+    }
+  });
 }
 
 async function handleUserMessage(message) {
@@ -191,7 +202,7 @@ async function handleUserMessage(message) {
   const plan = subscription.plan || "free";
 
   if (plan === "free" && used >= limit) {
-    await sendTelegramMessage(chatId, getLimitReachedMessage());
+    await sendUpgradeMessage(chatId);
     return;
   }
 
