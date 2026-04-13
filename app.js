@@ -9,7 +9,6 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-// منع التكرار
 const processedMessages = new Set();
 
 async function sendTelegramMessage(chatId, text) {
@@ -29,7 +28,7 @@ function headers() {
 
 async function upsertUser(telegramId, name) {
   await axios.post(
-    `${SUPABASE_URL}/rest/v1/users`,
+    `${SUPABASE_URL}/rest/v1/users?on_conflict=telegram_id`,
     {
       telegram_id: telegramId,
       name,
@@ -92,19 +91,15 @@ async function incrementMessagesUsed(subscriptionId, currentUsed) {
 }
 
 async function saveMessage(userId, question, answer) {
-  try {
-    await axios.post(
-      `${SUPABASE_URL}/rest/v1/messages`,
-      {
-        user_id: userId,
-        question,
-        answer,
-      },
-      { headers: headers() }
-    );
-  } catch (err) {
-    console.error("Supabase save error:", err.response?.data || err.message);
-  }
+  await axios.post(
+    `${SUPABASE_URL}/rest/v1/messages`,
+    {
+      user_id: userId,
+      question,
+      answer,
+    },
+    { headers: headers() }
+  );
 }
 
 async function getOpenAIReply(text) {
@@ -158,7 +153,6 @@ async function handleUserMessage(message) {
       .join(" ")
       .trim() || "Unknown";
 
-  // أوامر بسيطة
   if (text === "/start") {
     await sendTelegramMessage(
       chatId,
@@ -181,7 +175,16 @@ async function handleUserMessage(message) {
   }
 
   const user = await upsertUser(telegramId, name);
+
+  if (!user || !user.id) {
+    throw new Error("User fetch failed");
+  }
+
   const subscription = await ensureSubscription(user.id);
+
+  if (!subscription || !subscription.id) {
+    throw new Error("Subscription fetch failed");
+  }
 
   const used = subscription.messages_used || 0;
   const limit = subscription.messages_limit || 10;
@@ -220,7 +223,8 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
   handleUserMessage(message).catch(async (err) => {
-    console.error("Webhook processing error:", err.response?.data || err.message);
+    console.error("Webhook processing error:");
+    console.error(err.response?.data || err.message || err);
 
     try {
       await sendTelegramMessage(
@@ -228,7 +232,8 @@ app.post("/webhook", async (req, res) => {
         "حدث خطأ مؤقت. حاول مرة أخرى بعد قليل."
       );
     } catch (telegramErr) {
-      console.error("Telegram send error:", telegramErr.response?.data || telegramErr.message);
+      console.error("Telegram send error:");
+      console.error(telegramErr.response?.data || telegramErr.message || telegramErr);
     }
   });
 
