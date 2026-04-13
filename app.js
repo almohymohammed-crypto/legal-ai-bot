@@ -133,7 +133,8 @@ ${text}
     }
   );
 
-  return ai.data.output[0].content[0].text;
+return ai.data.output[0].content[0].text;
+}
   
 async function sendUpgradeMessage(chatId) {
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
