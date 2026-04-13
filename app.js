@@ -9,6 +9,146 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
+async function sendTelegramMessage(chatId, text) {
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+    {
+      chat_id: chatId,
+      text,
+    }
+  );
+}
+
+function supabaseHeaders() {
+  return {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${SUPABASE_KEY}`,
+    "Content-Type": "application/json",
+  };
+}
+
+async function upsertUser(telegramId, name) {
+  await axios.post(
+    `${SUPABASE_URL}/rest/v1/users`,
+    {
+      telegram_id: telegramId,
+      name,
+    },
+    {
+      headers: {
+        ...supabaseHeaders(),
+        Prefer: "resolution=merge-duplicates",
+      },
+    }
+  );
+
+  const userRes = await axios.get(
+    `${SUPABASE_URL}/rest/v1/users?telegram_id=eq.${encodeURIComponent(
+      telegramId
+    )}&select=id,telegram_id,name`,
+    {
+      headers: supabaseHeaders(),
+    }
+  );
+
+  return userRes.data[0];
+}
+
+async function ensureSubscription(userId) {
+  const subRes = await axios.get(
+    `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=*`,
+    {
+      headers: supabaseHeaders(),
+    }
+  );
+
+  if (subRes.data.length > 0) {
+    return subRes.data[0];
+  }
+
+  await axios.post(
+    `${SUPABASE_URL}/rest/v1/subscriptions`,
+    {
+      user_id: userId,
+      plan: "free",
+      messages_limit: 10,
+      messages_used: 0,
+    },
+    {
+      headers: supabaseHeaders(),
+    }
+  );
+
+  const newSubRes = await axios.get(
+    `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=*`,
+    {
+      headers: supabaseHeaders(),
+    }
+  );
+
+  return newSubRes.data[0];
+}
+
+async function saveMessage(userId, question, answer) {
+  await axios.post(
+    `${SUPABASE_URL}/rest/v1/messages`,
+    {
+      user_id: userId,
+      question,
+      answer,
+    },
+    {
+      headers: supabaseHeaders(),
+    }
+  );
+}
+
+async function incrementMessagesUsed(subscriptionId, currentUsed) {
+  await axios.patch(
+    `${SUPABASE_URL}/rest/v1/subscriptions?id=eq.${subscriptionId}`,
+    {
+      messages_used: currentUsed + 1,
+    },
+    {
+      headers: supabaseHeaders(),
+    }
+  );
+}
+
+async function getOpenAIReply(text) {
+  const openaiResponse = await axios.post(
+    "https://api.openai.com/v1/responses",
+    {
+      model: "gpt-4.1-mini",
+      input: `
+أنت مستشار قانوني متخصص في نظام العمل السعودي.
+
+أجب على السؤال التالي بشكل احترافي وواضح.
+
+التعليمات:
+- ابدأ بجواب مباشر
+- ثم شرح مبسط
+- إذا أمكن اذكر رقم المادة
+- لا تخترع معلومات
+- إذا لم تكن متأكدًا فقل ذلك بوضوح
+- اجعل الجواب مناسبًا للسعودية فقط
+- اختم بـ: "هذه معلومات عامة وليست استشارة قانونية رسمية"
+
+السؤال:
+${text}
+`,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  return openaiResponse.data.output[0].content[0].text;
+}
+
 app.post("/webhook", async (req, res) => {
   const message = req.body.message;
 
@@ -26,101 +166,61 @@ app.post("/webhook", async (req, res) => {
       .trim() || "Unknown";
 
   try {
-    // 1) احفظ أو حدّث المستخدم
-    await axios.post(
-      `${SUPABASE_URL}/rest/v1/users`,
-      {
-        telegram_id: telegramId,
-        name: name
-      },
-      {
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          "Content-Type": "application/json",
-          Prefer: "resolution=merge-duplicates"
-        }
-      }
-    );
+    const user = await upsertUser(telegramId, name);
 
-    // 2) هات المستخدم من قاعدة البيانات عشان نجيب id الداخلي
-    const userRes = await axios.get(
-      `${SUPABASE_URL}/rest/v1/users?telegram_id=eq.${telegramId}&select=id`,
-      {
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`
-        }
-      }
-    );
+    if (!user || !user.id) {
+      console.error("User was not created or fetched correctly");
+      return res.sendStatus(500);
+    }
 
-    const user = userRes.data[0];
+    const subscription = await ensureSubscription(user.id);
 
-    // 3) اسأل OpenAI
-    const openaiResponse = await axios.post(
-      "https://api.openai.com/v1/responses",
-      {
-        model: "gpt-4.1-mini",
-        input: `
-أنت مستشار قانوني متخصص في نظام العمل السعودي.
+    if (
+      subscription &&
+      subscription.plan === "free" &&
+      subscription.messages_used >= subscription.messages_limit
+    ) {
+      await sendTelegramMessage(
+        chatId,
+        "🚫 انتهى الحد المجاني لديك. الرجاء الاشتراك للاستمرار."
+      );
+      return res.sendStatus(200);
+    }
 
-أجب على السؤال التالي بشكل احترافي وواضح.
+    const reply = await getOpenAIReply(text);
 
-التعليمات:
-- ابدأ بجواب مباشر
-- ثم شرح مبسط
-- إذا أمكن اذكر رقم المادة
-- لا تخترع معلومات
-- إذا لم تكن متأكدًا فقل ذلك بوضوح
-- اختم بـ: "هذه معلومات عامة وليست استشارة قانونية رسمية"
+    await saveMessage(user.id, text, reply);
 
-السؤال:
-${text}
-`
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    const reply = openaiResponse.data.output[0].content[0].text;
-
-    // 4) احفظ السؤال والجواب
-    if (user && user.id) {
-      await axios.post(
-        `${SUPABASE_URL}/rest/v1/messages`,
-        {
-          user_id: user.id,
-          question: text,
-          answer: reply
-        },
-        {
-          headers: {
-            apikey: SUPABASE_KEY,
-            Authorization: `Bearer ${SUPABASE_KEY}`,
-            "Content-Type": "application/json"
-          }
-        }
+    if (subscription) {
+      await incrementMessagesUsed(
+        subscription.id,
+        subscription.messages_used || 0
       );
     }
 
-    // 5) أرسل الرد إلى تيليجرام
-    await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-      {
-        chat_id: chatId,
-        text: reply
-      }
-    );
+    await sendTelegramMessage(chatId, reply);
 
     return res.sendStatus(200);
   } catch (error) {
     console.error(
+      "Webhook error:",
       error.response ? error.response.data : error.message
     );
+
+    try {
+      await sendTelegramMessage(
+        chatId,
+        "حدث خطأ مؤقت. حاول مرة أخرى بعد قليل."
+      );
+    } catch (telegramError) {
+      console.error(
+        "Telegram send error:",
+        telegramError.response
+          ? telegramError.response.data
+          : telegramError.message
+      );
+    }
+
     return res.sendStatus(500);
   }
 });
