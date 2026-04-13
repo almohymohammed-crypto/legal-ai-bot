@@ -9,6 +9,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
+const PAYMENT_URL = "https://your-payment-link.com";
+
 async function sendTelegramMessage(chatId, text) {
   await axios.post(
     `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
@@ -73,6 +75,7 @@ async function ensureSubscription(userId) {
       plan: "free",
       messages_limit: 10,
       messages_used: 0,
+      expires_at: null,
     },
     {
       headers: supabaseHeaders(),
@@ -103,16 +106,65 @@ async function saveMessage(userId, question, answer) {
   );
 }
 
-async function incrementMessagesUsed(subscriptionId, currentUsed) {
+async function updateSubscription(subscriptionId, data) {
   await axios.patch(
     `${SUPABASE_URL}/rest/v1/subscriptions?id=eq.${subscriptionId}`,
-    {
-      messages_used: currentUsed + 1,
-    },
+    data,
     {
       headers: supabaseHeaders(),
     }
   );
+}
+
+function isPaidSubscriptionActive(subscription) {
+  if (!subscription) return false;
+  if (subscription.plan !== "paid") return false;
+  if (!subscription.expires_at) return true;
+
+  const now = new Date();
+  const expiry = new Date(subscription.expires_at);
+  return expiry > now;
+}
+
+async function normalizeExpiredPaidSubscription(subscription) {
+  if (!subscription || subscription.plan !== "paid" || !subscription.expires_at) {
+    return subscription;
+  }
+
+  const now = new Date();
+  const expiry = new Date(subscription.expires_at);
+
+  if (expiry <= now) {
+    await updateSubscription(subscription.id, {
+      plan: "free",
+      messages_limit: 10,
+      messages_used: 0,
+      expires_at: null,
+    });
+
+    return {
+      ...subscription,
+      plan: "free",
+      messages_limit: 10,
+      messages_used: 0,
+      expires_at: null,
+    };
+  }
+
+  return subscription;
+}
+
+function hasFreeMessagesRemaining(subscription) {
+  const used = subscription.messages_used || 0;
+  const limit = subscription.messages_limit || 10;
+  return used < limit;
+}
+
+async function incrementMessagesUsed(subscription) {
+  const used = subscription.messages_used || 0;
+  await updateSubscription(subscription.id, {
+    messages_used: used + 1,
+  });
 }
 
 async function getOpenAIReply(text) {
@@ -131,7 +183,7 @@ async function getOpenAIReply(text) {
 - إذا أمكن اذكر رقم المادة
 - لا تخترع معلومات
 - إذا لم تكن متأكدًا فقل ذلك بوضوح
-- اجعل الجواب مناسبًا للسعودية فقط
+- اجعل الإجابة خاصة بالسعودية فقط
 - اختم بـ: "هذه معلومات عامة وليست استشارة قانونية رسمية"
 
 السؤال:
@@ -147,6 +199,15 @@ ${text}
   );
 
   return openaiResponse.data.output[0].content[0].text;
+}
+
+function getUpgradeMessage() {
+  return `🚫 انتهى الحد المجاني لديك.
+
+للاستمرار، اشترك في الباقة المدفوعة عبر الرابط التالي:
+${PAYMENT_URL}
+
+بعد الدفع سيتم تفعيل اشتراكك تلقائيًا.`;
 }
 
 app.post("/webhook", async (req, res) => {
@@ -173,33 +234,30 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(500);
     }
 
-    const subscription = await ensureSubscription(user.id);
+    let subscription = await ensureSubscription(user.id);
+    subscription = await normalizeExpiredPaidSubscription(subscription);
 
-    if (
-      subscription &&
-      subscription.plan === "free" &&
-      subscription.messages_used >= subscription.messages_limit
-    ) {
-      await sendTelegramMessage(
-        chatId,
-        "🚫 انتهى الحد المجاني لديك. الرجاء الاشتراك للاستمرار."
-      );
+    if (isPaidSubscriptionActive(subscription)) {
+      const reply = await getOpenAIReply(text);
+      await saveMessage(user.id, text, reply);
+      await sendTelegramMessage(chatId, reply);
       return res.sendStatus(200);
     }
 
-    const reply = await getOpenAIReply(text);
+    if (subscription.plan === "free") {
+      if (!hasFreeMessagesRemaining(subscription)) {
+        await sendTelegramMessage(chatId, getUpgradeMessage());
+        return res.sendStatus(200);
+      }
 
-    await saveMessage(user.id, text, reply);
-
-    if (subscription) {
-      await incrementMessagesUsed(
-        subscription.id,
-        subscription.messages_used || 0
-      );
+      const reply = await getOpenAIReply(text);
+      await saveMessage(user.id, text, reply);
+      await incrementMessagesUsed(subscription);
+      await sendTelegramMessage(chatId, reply);
+      return res.sendStatus(200);
     }
 
-    await sendTelegramMessage(chatId, reply);
-
+    await sendTelegramMessage(chatId, getUpgradeMessage());
     return res.sendStatus(200);
   } catch (error) {
     console.error(
