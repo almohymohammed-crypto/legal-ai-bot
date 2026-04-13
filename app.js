@@ -9,8 +9,13 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
+// 🔥 رابط الدفع (غيّره لاحقًا)
+const PAYMENT_URL = "https://your-payment-link.com";
+
+// منع التكرار
 const processedMessages = new Set();
 
+// إرسال رسالة عادية
 async function sendTelegramMessage(chatId, text) {
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     chat_id: chatId,
@@ -18,6 +23,27 @@ async function sendTelegramMessage(chatId, text) {
   });
 }
 
+// إرسال رسالة الاشتراك
+async function sendUpgradeMessage(chatId) {
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    chat_id: chatId,
+    text: `🚫 انتهى الحد المجاني لديك
+
+اشترك الآن للحصول على استخدام غير محدود 🚀`,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "اشترك الآن 💳",
+            url: PAYMENT_URL,
+          },
+        ],
+      ],
+    },
+  });
+}
+
+// Headers Supabase
 function headers() {
   return {
     apikey: SUPABASE_KEY,
@@ -26,6 +52,7 @@ function headers() {
   };
 }
 
+// إنشاء أو تحديث المستخدم
 async function upsertUser(telegramId, name) {
   await axios.post(
     `${SUPABASE_URL}/rest/v1/users?on_conflict=telegram_id`,
@@ -42,15 +69,14 @@ async function upsertUser(telegramId, name) {
   );
 
   const result = await axios.get(
-    `${SUPABASE_URL}/rest/v1/users?telegram_id=eq.${encodeURIComponent(
-      telegramId
-    )}&select=*`,
+    `${SUPABASE_URL}/rest/v1/users?telegram_id=eq.${telegramId}&select=*`,
     { headers: headers() }
   );
 
   return result.data[0];
 }
 
+// إنشاء الاشتراك إذا غير موجود
 async function ensureSubscription(userId) {
   const result = await axios.get(
     `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=*`,
@@ -80,6 +106,7 @@ async function ensureSubscription(userId) {
   return created.data[0];
 }
 
+// زيادة عدد الرسائل
 async function incrementMessagesUsed(subscriptionId, currentUsed) {
   await axios.patch(
     `${SUPABASE_URL}/rest/v1/subscriptions?id=eq.${subscriptionId}`,
@@ -90,6 +117,7 @@ async function incrementMessagesUsed(subscriptionId, currentUsed) {
   );
 }
 
+// حفظ الرسالة
 async function saveMessage(userId, question, answer) {
   await axios.post(
     `${SUPABASE_URL}/rest/v1/messages`,
@@ -102,6 +130,7 @@ async function saveMessage(userId, question, answer) {
   );
 }
 
+// OpenAI
 async function getOpenAIReply(text) {
   const ai = await axios.post(
     "https://api.openai.com/v1/responses",
@@ -133,28 +162,10 @@ ${text}
     }
   );
 
-return ai.data.output[0].content[0].text;
-}
-  
-async function sendUpgradeMessage(chatId) {
-  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-    chat_id: chatId,
-    text: `🚫 انتهى الحد المجاني لديك
-
-اشترك الآن للحصول على استخدام غير محدود 🚀`,
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "اشترك الآن 💳",
-            url: "https://your-payment-link.com"
-          }
-        ]
-      ]
-    }
-  });
+  return ai.data.output[0].content[0].text;
 }
 
+// المعالجة الرئيسية
 async function handleUserMessage(message) {
   const chatId = message.chat.id;
   const text = message.text;
@@ -165,44 +176,33 @@ async function handleUserMessage(message) {
       .join(" ")
       .trim() || "Unknown";
 
+  // أوامر
   if (text === "/start") {
     await sendTelegramMessage(
       chatId,
-      "أهلًا بك في المستشار القانوني 🇸🇦\n\nلك 10 رسائل مجانية. اكتب سؤالك مباشرة."
+      "أهلًا بك في المستشار القانوني 🇸🇦\n\nلك 10 رسائل مجانية."
     );
     return;
   }
 
   if (text === "/plan") {
     const user = await upsertUser(telegramId, name);
-    const subscription = await ensureSubscription(user.id);
-    const used = subscription.messages_used || 0;
-    const limit = subscription.messages_limit || 10;
+    const sub = await ensureSubscription(user.id);
 
     await sendTelegramMessage(
       chatId,
-      `خطتك الحالية: ${subscription.plan}\nاستهلاكك: ${used}/${limit}`
+      `الخطة: ${sub.plan}\nاستخدمت: ${sub.messages_used}/${sub.messages_limit}`
     );
     return;
   }
 
   const user = await upsertUser(telegramId, name);
-
-  if (!user || !user.id) {
-    throw new Error("User fetch failed");
-  }
-
   const subscription = await ensureSubscription(user.id);
-
-  if (!subscription || !subscription.id) {
-    throw new Error("Subscription fetch failed");
-  }
 
   const used = subscription.messages_used || 0;
   const limit = subscription.messages_limit || 10;
-  const plan = subscription.plan || "free";
 
-  if (plan === "free" && used >= limit) {
+  if (subscription.plan === "free" && used >= limit) {
     await sendUpgradeMessage(chatId);
     return;
   }
@@ -210,14 +210,12 @@ async function handleUserMessage(message) {
   const reply = await getOpenAIReply(text);
 
   await saveMessage(user.id, text, reply);
-
-  if (plan === "free") {
-    await incrementMessagesUsed(subscription.id, used);
-  }
+  await incrementMessagesUsed(subscription.id, used);
 
   await sendTelegramMessage(chatId, reply);
 }
 
+// webhook
 app.post("/webhook", async (req, res) => {
   const message = req.body.message;
 
@@ -235,18 +233,12 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
   handleUserMessage(message).catch(async (err) => {
-    console.error("Webhook processing error:");
-    console.error(err.response?.data || err.message || err);
+    console.error(err.response?.data || err.message);
 
-    try {
-      await sendTelegramMessage(
-        message.chat.id,
-        "حدث خطأ مؤقت. حاول مرة أخرى بعد قليل."
-      );
-    } catch (telegramErr) {
-      console.error("Telegram send error:");
-      console.error(telegramErr.response?.data || telegramErr.message || telegramErr);
-    }
+    await sendTelegramMessage(
+      message.chat.id,
+      "حدث خطأ مؤقت. حاول لاحقًا"
+    );
   });
 
   setTimeout(() => {
@@ -254,10 +246,7 @@ app.post("/webhook", async (req, res) => {
   }, 10 * 60 * 1000);
 });
 
-app.get("/", (req, res) => {
-  res.send("Bot is running 🚀");
-});
-
+// تشغيل السيرفر
 app.listen(10000, () => {
-  console.log("Running on port 10000");
+  console.log("Running 🚀");
 });
