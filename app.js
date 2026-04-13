@@ -9,7 +9,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-// منع التكرار في الذاكرة
+// منع التكرار
 const processedMessages = new Set();
 
 async function sendTelegramMessage(chatId, text) {
@@ -27,11 +27,76 @@ function headers() {
   };
 }
 
-async function saveMessage(question, answer) {
+async function upsertUser(telegramId, name) {
+  await axios.post(
+    `${SUPABASE_URL}/rest/v1/users`,
+    {
+      telegram_id: telegramId,
+      name,
+    },
+    {
+      headers: {
+        ...headers(),
+        Prefer: "resolution=merge-duplicates",
+      },
+    }
+  );
+
+  const result = await axios.get(
+    `${SUPABASE_URL}/rest/v1/users?telegram_id=eq.${encodeURIComponent(
+      telegramId
+    )}&select=*`,
+    { headers: headers() }
+  );
+
+  return result.data[0];
+}
+
+async function ensureSubscription(userId) {
+  const result = await axios.get(
+    `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=*`,
+    { headers: headers() }
+  );
+
+  if (result.data.length > 0) {
+    return result.data[0];
+  }
+
+  await axios.post(
+    `${SUPABASE_URL}/rest/v1/subscriptions`,
+    {
+      user_id: userId,
+      plan: "free",
+      messages_limit: 10,
+      messages_used: 0,
+    },
+    { headers: headers() }
+  );
+
+  const created = await axios.get(
+    `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${userId}&select=*`,
+    { headers: headers() }
+  );
+
+  return created.data[0];
+}
+
+async function incrementMessagesUsed(subscriptionId, currentUsed) {
+  await axios.patch(
+    `${SUPABASE_URL}/rest/v1/subscriptions?id=eq.${subscriptionId}`,
+    {
+      messages_used: currentUsed + 1,
+    },
+    { headers: headers() }
+  );
+}
+
+async function saveMessage(userId, question, answer) {
   try {
     await axios.post(
       `${SUPABASE_URL}/rest/v1/messages`,
       {
+        user_id: userId,
         question,
         answer,
       },
@@ -42,10 +107,7 @@ async function saveMessage(question, answer) {
   }
 }
 
-async function handleUserMessage(message) {
-  const chatId = message.chat.id;
-  const text = message.text;
-
+async function getOpenAIReply(text) {
   const ai = await axios.post(
     "https://api.openai.com/v1/responses",
     {
@@ -76,9 +138,68 @@ ${text}
     }
   );
 
-  const reply = ai.data.output[0].content[0].text;
+  return ai.data.output[0].content[0].text;
+}
 
-  await saveMessage(text, reply);
+function getLimitReachedMessage() {
+  return `🚫 انتهى الحد المجاني لديك (10 رسائل).
+
+للاستمرار، اشترك في الباقة المدفوعة.
+سيتم قريبًا توفير رابط الاشتراك داخل البوت.`;
+}
+
+async function handleUserMessage(message) {
+  const chatId = message.chat.id;
+  const text = message.text;
+  const telegramId = String(message.from.id);
+  const name =
+    [message.from.first_name, message.from.last_name]
+      .filter(Boolean)
+      .join(" ")
+      .trim() || "Unknown";
+
+  // أوامر بسيطة
+  if (text === "/start") {
+    await sendTelegramMessage(
+      chatId,
+      "أهلًا بك في المستشار القانوني 🇸🇦\n\nلك 10 رسائل مجانية. اكتب سؤالك مباشرة."
+    );
+    return;
+  }
+
+  if (text === "/plan") {
+    const user = await upsertUser(telegramId, name);
+    const subscription = await ensureSubscription(user.id);
+    const used = subscription.messages_used || 0;
+    const limit = subscription.messages_limit || 10;
+
+    await sendTelegramMessage(
+      chatId,
+      `خطتك الحالية: ${subscription.plan}\nاستهلاكك: ${used}/${limit}`
+    );
+    return;
+  }
+
+  const user = await upsertUser(telegramId, name);
+  const subscription = await ensureSubscription(user.id);
+
+  const used = subscription.messages_used || 0;
+  const limit = subscription.messages_limit || 10;
+  const plan = subscription.plan || "free";
+
+  if (plan === "free" && used >= limit) {
+    await sendTelegramMessage(chatId, getLimitReachedMessage());
+    return;
+  }
+
+  const reply = await getOpenAIReply(text);
+
+  await saveMessage(user.id, text, reply);
+
+  if (plan === "free") {
+    await incrementMessagesUsed(subscription.id, used);
+  }
+
   await sendTelegramMessage(chatId, reply);
 }
 
@@ -91,28 +212,26 @@ app.post("/webhook", async (req, res) => {
 
   const uniqueId = `${message.chat.id}_${message.message_id}`;
 
-  // إذا الرسالة تكررت، تجاهلها
   if (processedMessages.has(uniqueId)) {
     return res.sendStatus(200);
   }
 
   processedMessages.add(uniqueId);
-
-  // رجّع 200 فورًا حتى Telegram لا يعيد الإرسال
   res.sendStatus(200);
 
-  // ثم كمل المعالجة في الخلفية
   handleUserMessage(message).catch(async (err) => {
     console.error("Webhook processing error:", err.response?.data || err.message);
 
     try {
-      await sendTelegramMessage(message.chat.id, "حدث خطأ مؤقت. حاول مرة أخرى بعد قليل.");
+      await sendTelegramMessage(
+        message.chat.id,
+        "حدث خطأ مؤقت. حاول مرة أخرى بعد قليل."
+      );
     } catch (telegramErr) {
       console.error("Telegram send error:", telegramErr.response?.data || telegramErr.message);
     }
   });
 
-  // تنظيف الذاكرة بعد 10 دقائق
   setTimeout(() => {
     processedMessages.delete(uniqueId);
   }, 10 * 60 * 1000);
